@@ -26,3 +26,10 @@ git clone https://github.com/yourusername/sk-neuro.git
 cd sk-neuro
 pip install -e .
 ```
+
+This package uses a standard `pyproject.toml` and the PEP 517 build system. To create a source distribution or wheel run:
+
+```bash
+python -m build
+```
+
