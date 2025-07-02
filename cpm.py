@@ -88,63 +88,66 @@ class CPM(BaseEstimator):
         shap_vals = explainer.shap_values(feats)
         return shap_vals, feats, ['pos_sum', 'neg_sum']
 
-# ─── Nested CV + Bootstrap CI example ────────────────────────────────────────
+if __name__ == "__main__":
 
-# assume X (n×E) and y (n,) are your data arrays
+    # ─── Nested CV + Bootstrap CI example ────────────────────────────────────────
 
-# 1. Build pipeline & param grid
-pipe = Pipeline([
-    ('sel', SelectEdges()),        # will get its threshold from GridSearchCV
-    ('reg', Ridge())
-])
-param_grid = {
-    'sel__threshold': [1e-4, 1e-3, 1e-2, 5e-2],
-    'reg__alpha':   np.logspace(-3, 1, 10)
-}
+    # assume X (n×E) and y (n,) are your data arrays
 
-inner_cv = KFold(n_splits=5, shuffle=True, random_state=0)
-outer_cv = KFold(n_splits=10, shuffle=True, random_state=1)
+    # 1. Build pipeline & param grid
+    pipe = Pipeline([
+        ('sel', SelectEdges()),        # will get its threshold from GridSearchCV
+        ('reg', Ridge())
+    ])
+    param_grid = {
+        'sel__threshold': [1e-4, 1e-3, 1e-2, 5e-2],
+        'reg__alpha':   np.logspace(-3, 1, 10)
+    }
 
-# 2. Wrap in a GridSearchCV for nested tuning
-grid = GridSearchCV(pipe,
-                    param_grid,
-                    cv=inner_cv,
-                    scoring='r2',
-                    n_jobs=-1)
+    inner_cv = KFold(n_splits=5, shuffle=True, random_state=0)
+    outer_cv = KFold(n_splits=10, shuffle=True, random_state=1)
 
-# 3. Outer‐loop CV predictions
-y_pred = cross_val_predict(grid, X, y, cv=outer_cv, n_jobs=-1)
-r_outer = pearsonr(y, y_pred)[0]
-print(f"Nested‐CV Pearson r = {r_outer:.3f}")
+    # 2. Wrap in a GridSearchCV for nested tuning
+    grid = GridSearchCV(pipe,
+                        param_grid,
+                        cv=inner_cv,
+                        scoring='r2',
+                        n_jobs=-1)
 
-# 4. Bootstrap CI on that r
-def bootstrap_ci(model, X, y, cv, n_boot=500, ci=95):
-    rng = np.random.RandomState(2)
-    stats = []
-    n = len(y)
-    for _ in range(n_boot):
-        idx = rng.randint(0, n, n)
-        yb = y[idx]; Xb = X[idx]
-        ypb = cross_val_predict(model, Xb, yb, cv=cv, n_jobs=-1)
-        stats.append(pearsonr(yb, ypb)[0])
-    lo = np.percentile(stats, (100 - ci) / 2)
-    hi = np.percentile(stats, 100 - (100 - ci) / 2)
-    return lo, hi
+    # 3. Outer‐loop CV predictions
+    y_pred = cross_val_predict(grid, X, y, cv=outer_cv, n_jobs=-1)
+    r_outer = pearsonr(y, y_pred)[0]
+    print(f"Nested‐CV Pearson r = {r_outer:.3f}")
 
-lo, hi = bootstrap_ci(grid, X, y, outer_cv)
-print(f"95% CI for r: [{lo:.3f}, {hi:.3f}]")
+    # 4. Bootstrap CI on that r
+    def bootstrap_ci(model, X, y, cv, n_boot=500, ci=95):
+        rng = np.random.RandomState(2)
+        stats = []
+        n = len(y)
+        for _ in range(n_boot):
+            idx = rng.randint(0, n, n)
+            yb = y[idx]; Xb = X[idx]
+            ypb = cross_val_predict(model, Xb, yb, cv=cv, n_jobs=-1)
+            stats.append(pearsonr(yb, ypb)[0])
+        lo = np.percentile(stats, (100 - ci) / 2)
+        hi = np.percentile(stats, 100 - (100 - ci) / 2)
+        return lo, hi
 
-# 5. Refit on full data & SHAP explain
-grid.fit(X, y)
-best_pipe = grid.best_estimator_
-shap_vals, feats, names = best_pipe.named_steps['sel'].transform(X), None, None
-# actually, to get SHAP:
-selector = best_pipe.named_steps['sel']
-model    = best_pipe.named_steps['reg']
-feats    = selector.transform(X)
-explainer= shap.LinearExplainer(model, feats, feature_dependence="independent")
-shap_vals= explainer.shap_values(feats)
+    lo, hi = bootstrap_ci(grid, X, y, outer_cv)
+    print(f"95% CI for r: [{lo:.3f}, {hi:.3f}]")
 
-# now you can:
-# shap.summary_plot(shap_vals, feats, feature_names=['pos_sum','neg_sum'])
-# shap.force_plot(explainer.expected_value, shap_vals[0], feats[0], feature_names=['pos_sum','neg_sum'])
+    # 5. Refit on full data & SHAP explain
+    grid.fit(X, y)
+    best_pipe = grid.best_estimator_
+    shap_vals, feats, names = best_pipe.named_steps['sel'].transform(X), None, None
+    # actually, to get SHAP:
+    selector = best_pipe.named_steps['sel']
+    model    = best_pipe.named_steps['reg']
+    feats    = selector.transform(X)
+    explainer= shap.LinearExplainer(model, feats, feature_dependence="independent")
+    shap_vals= explainer.shap_values(feats)
+
+    # now you can:
+    # shap.summary_plot(shap_vals, feats, feature_names=['pos_sum','neg_sum'])
+    # shap.force_plot(explainer.expected_value, shap_vals[0], feats[0], feature_names=['pos_sum','neg_sum'])
+
