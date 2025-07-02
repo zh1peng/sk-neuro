@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sk-neuro"
+version = "0.1.0"
+description = "Scikit-learn–style machine learning wrappers for neuroimaging prediction."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+  { name = "Your Name", email = "your@email.com" }
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "shap"
+]
+
+[project.urls]
+Homepage = "https://github.com/zh1peng/sk-neuro"
+Documentation = "https://github.com/zh1peng/sk-neuro#readme"
+Source = "https://github.com/zh1peng/sk-neuro"
+Issues = "https://github.com/zh1peng/sk-neuro/issues"
