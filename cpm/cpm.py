@@ -1,402 +1,406 @@
+#!/usr/bin/env python3
+"""cpm_code/CPM_pipe.py — Connectome-based Predictive Modeling (clean version).
+
+This file defines four public callables that are fully clone-able and
+cross-validation friendly:
+
+``regress_out_covariates``
+    Linear residualisation via ordinary least squares.
+``fc_behav_test``
+    Edge-wise Pearson/ANOVA with optional covariate residualisation.
+``EdgeSelector``
+    Transformer that converts full FC edges → CPM summary features.
+``CPM_pipe``
+    End-to-end CPM pipeline that routes columns by **name** and fits a final
+    linear/logistic model. Compatible with :func:`sklearn.base.clone`.
+"""
+from __future__ import annotations
+
+from typing import Iterable, List
+
 import numpy as np
-from scipy.stats import pearsonr
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import Ridge, LogisticRegression
-from sklearn.feature_selection import f_classif
 import shap
+from scipy.stats import pearsonr
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import f_classif
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.pipeline import Pipeline
 
-def regress_out_covariates(Y: np.ndarray, C: np.ndarray) -> np.ndarray:
-    """
-    Residualize one or more outcome variables with respect to covariates via ordinary least squares regression.
+__all__ = [
+    "regress_out_covariates",
+    "fc_behav_test",
+    "EdgeSelector",
+    "CPM_pipe",
+]
 
-    This function adds an intercept column to the covariate matrix, computes the least-squares fit
-    of Y on C, and returns the residuals (original Y minus fitted values).
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def _to_numpy(arr):
+    """Convert input to NumPy array without copying if already an ndarray.
 
     Parameters
     ----------
-    Y : np.ndarray, shape (n_samples, n_targets)
-        Outcome matrix where each column is a target variable to residualize.
-    C : np.ndarray, shape (n_samples, n_covariates)
-        Covariate matrix without intercept (columns correspond to covariates).
+    arr : array-like
+        Any object convertible to a NumPy array.
 
     Returns
     -------
-    np.ndarray, shape (n_samples, n_targets)
-        Residuals of Y after regressing out the linear effects of C.
+    np.ndarray
+        The input as a NumPy array.
+    """
+    return np.asarray(arr)
+
+
+def regress_out_covariates(Y: np.ndarray, C: np.ndarray) -> np.ndarray:  # noqa: N802
+    """Residualise target(s) Y with respect to covariates C via OLS.
+
+    Solves for β in [1, C]β ≈ Y and returns the residuals Y − Ŷ.
+
+    Parameters
+    ----------
+    Y : ndarray, shape (n_samples, n_targets)
+        Matrix of outcomes to residualise (each column is one target variable).
+    C : ndarray, shape (n_samples, n_covariates)
+        Covariate matrix (does *not* include intercept column).
+
+    Returns
+    -------
+    residuals : ndarray, shape (n_samples, n_targets)
+        The matrix of residuals after regressing out C (with intercept).
 
     Raises
     ------
     ValueError
-        If the number of rows in Y and C do not match.
-
-    Notes
-    -----
-    - Uses Moore–Penrose pseudoinverse for numerical stability.
-    - Residuals have zero correlation with each covariate (by construction).
+        If Y and C have mismatched numbers of rows (samples).
 
     Examples
     --------
     >>> Y = np.random.randn(100, 2)
     >>> C = np.random.randn(100, 3)
-    >>> Y_resid = regress_out_covariates(Y, C)
+    >>> resid = regress_out_covariates(Y, C)
+    >>> resid.shape
+    (100, 2)
     """
+    Y = _to_numpy(Y)
+    C = _to_numpy(C)
     if Y.shape[0] != C.shape[0]:
-        raise ValueError("Number of samples in Y and C must match.")
-    n = C.shape[0]
-    # Add intercept
-    Xc = np.hstack((np.ones((n, 1)), C))
-    # Compute fitted values
-    pinv = np.linalg.pinv(Xc)
-    fitted = Xc @ (pinv @ Y)
-    return Y - fitted
+        raise ValueError("Y and C must have the same number of rows.")
+    # add intercept column of ones
+    Xc = np.hstack((np.ones((Y.shape[0], 1)), C))
+    # compute fitted values and subtract
+    beta = np.linalg.pinv(Xc) @ Y
+    return Y - (Xc @ beta)
 
 
 def fc_behav_test(
     X: np.ndarray,
     y: np.ndarray,
-    task: str = 'regression',
-    covariates: np.ndarray = None
+    *,
+    task: str = "regression",
+    covariates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Perform univariate edge-wise statistical tests between connectivity features and behavior.
+    """Perform edge-wise univariate tests between FC edges and behavior.
 
-    For continuous targets (regression), computes Pearson correlation (r and p-value) per edge.
-    For categorical targets (classification), performs one-way ANOVA F-test (F statistic and p-value) per edge.
-    Optionally residualizes features and target against covariates prior to testing.
+    For regression, uses two-tailed Pearson correlation per edge.
+    For classification, uses ANOVA F-test per edge.
 
     Parameters
     ----------
-    X : np.ndarray, shape (n_samples, n_edges)
-        Connectivity feature matrix where each column is a flattened edge weight.
-    y : np.ndarray, shape (n_samples,) or (n_samples, 1)
-        Target vector: continuous for regression, integer labels for classification.
-    task : {'regression', 'classification'}, default 'regression'
+    X : ndarray, shape (n_samples, n_edges)
+        Matrix of flattened functional connectivity edge weights.
+    y : ndarray, shape (n_samples,)
+        Vector of behavioral or diagnostic values.
+    task : {'regression', 'classification'}, default='regression'
         Type of statistical test to perform.
-    covariates : np.ndarray, shape (n_samples, n_covariates), optional
-        If provided, both X and y will be residualized via regress_out_covariates before testing.
+        - 'regression': two-tailed Pearson correlation.
+        - 'classification': F-test (ANOVA) via sklearn.feature_selection.f_classif.
+    covariates : ndarray, shape (n_samples, n_covariates) or None, default=None
+        Optional covariate matrix. If provided, both X and y are
+        residualised with respect to these via :func:`regress_out_covariates`.
 
     Returns
     -------
-    values : np.ndarray, shape (n_edges,)
-        Test statistics per edge (Pearson r or F statistic).
-    p_vals : np.ndarray, shape (n_edges,)
-        Corresponding p-values per edge.
+    stats : ndarray, shape (n_edges,)
+        Test statistic per edge (Pearson r or F-value).
+    pvals : ndarray, shape (n_edges,)
+        Two-tailed p-value per edge (or ANOVA p-value).
 
     Raises
     ------
     ValueError
-        If `task` is not one of 'regression' or 'classification'.
+        If `task` is not one of the allowed options.
+
+    See Also
+    --------
+    scipy.stats.pearsonr
+    sklearn.feature_selection.f_classif
 
     Examples
     --------
     >>> X = np.random.randn(50, 1000)
     >>> y = np.random.randn(50)
-    >>> r_vals, p_vals = fc_behav_test(X, y, task='regression')
+    >>> stats, pvals = fc_behav_test(X, y, task='regression')
+    >>> stats.shape, pvals.shape
+    ((1000,), (1000,))
     """
-    # Optional covariate residualization
+    X = _to_numpy(X)
+    y = _to_numpy(y).ravel()
+
+    # residualise if covariates provided
     if covariates is not None:
         X = regress_out_covariates(X, covariates)
         y = regress_out_covariates(y.reshape(-1, 1), covariates).ravel()
 
-    if task == 'regression':
-        E = X.shape[1]
-        r_vals = np.empty(E)
-        p_vals = np.empty(E)
-        for i in range(E):
-            r_vals[i], p_vals[i] = pearsonr(X[:, i], y)
-        return r_vals, p_vals
+    if task == "regression":
+        n_edges = X.shape[1]
+        stats = np.empty(n_edges)
+        pvals = np.empty(n_edges)
+        for i in range(n_edges):
+            stats[i], pvals[i] = pearsonr(X[:, i], y)
+        return stats, pvals
 
-    elif task == 'classification':
-        F_vals, p_vals = f_classif(X, y)
-        return F_vals, p_vals
+    if task == "classification":
+        return f_classif(X, y)
 
-    else:
-        raise ValueError("Invalid task. Must be 'regression' or 'classification'.")
+    raise ValueError("task must be 'regression' or 'classification'.")
 
+
+# -----------------------------------------------------------------------------
+# Transformer: EdgeSelector
+# -----------------------------------------------------------------------------
 
 class EdgeSelector(BaseEstimator, TransformerMixin):
-    """
-    Selects predictive edges based on univariate tests and summarizes them.
+    """Transformer that selects behavior-associated FC edges and summarizes them.
 
-    This transformer retains only those edges whose p-value from a univariate test
-    (regression or classification) falls below a given threshold. It then reduces the
-    feature space by summarizing the selected edges into two features per sample:
-    the sum of all positive-edge weights and the sum of all negative-edge weights.
+    During `fit`, performs univariate tests on each edge and builds boolean
+    masks for positive and/or negative edge sets below threshold. During
+    `transform`, sums edge weights across each selected set to yield one or
+    two summary features per sample: 'pos_sum' and/or 'neg_sum'.
 
     Parameters
     ----------
     threshold : float, default=0.01
-        P-value cutoff for selecting edges.
+        P-value threshold for selecting edges.
     task : {'regression', 'classification'}, default='regression'
-        Determines whether to use Pearson correlation or ANOVA for univariate testing.
-    covariates : np.ndarray, shape (n_samples, n_covariates), optional
-        If provided, residualize features and target against these covariates before selection.
+        Type of univariate test (see `fc_behav_test`).
+    network_type : {'pos', 'neg', 'both'}, default='both'
+        Which edges to include in summary:
+        - 'pos': only edges with positive association.
+        - 'neg': only edges with negative association.
+        - 'both': include both and return two features.
+    covariates : ndarray, shape (n_samples, n_covariates) or None
+        Optional covariate matrix for residualisation before edge testing.
 
     Attributes
     ----------
-    mask_ : np.ndarray, shape (n_edges,)
-        Boolean mask indicating which edges were selected (True) or discarded (False).
+    mask_pos_ : ndarray of bool, shape (n_edges,)
+        Boolean mask of positively associated edges surviving threshold.
+    mask_neg_ : ndarray of bool, shape (n_edges,)
+        Boolean mask of negatively associated edges surviving threshold.
 
     Examples
     --------
-    >>> selector = EdgeSelector(threshold=0.05, task='regression')
-    >>> selector.fit(X, y)
-    >>> X_reduced = selector.transform(X)
+    >>> sel = EdgeSelector(threshold=0.05, task='regression', network_type='both')
+    >>> sel.fit(X, y)
+    >>> feats = sel.transform(X)
+    >>> feats.shape  # two summary features per sample
+    (n_samples, 2)
     """
+
     def __init__(
         self,
         threshold: float = 0.01,
-        task: str = 'regression',
-        covariates: np.ndarray = None
-    ):
+        task: str = "regression",
+        network_type: str = "both",
+        covariates: np.ndarray | None = None,
+    ) -> None:
         self.threshold = threshold
         self.task = task
+        self.network_type = network_type
         self.covariates = covariates
 
-    def _apply_mask(self, row_fc: np.ndarray) -> np.ndarray:
-        """
-        Internal: Keep only the edge weights where mask_ is True.
+    def fit(self, X, y):  # noqa: D401
+        """Learn which edges survive behavioral association threshold.
 
         Parameters
         ----------
-        row_fc : np.ndarray, shape (n_edges,)
-            Flattened connectivity vector for one sample.
+        X : array-like, shape (n_samples, n_edges)
+            FC edge matrix.
+        y : array-like, shape (n_samples,)
+            Behavioral or diagnostic vector.
 
         Returns
         -------
-        np.ndarray, shape (n_selected_edges,)
-            Edge weights passing the mask.
-        """
-        return row_fc[self.mask_]
-
-    def _sum_edges(self, vec: np.ndarray, method: str = 'pos') -> float:
-        """
-        Internal: Sum edge weights by sign.
-
-        Parameters
-        ----------
-        vec : np.ndarray, shape (n_selected_edges,)
-            Connectivity weights after masking.
-        method : {'pos', 'neg'}, default='pos'
-            'pos' sums only positive weights;
-            'neg' sums only negative weights.
-
-        Returns
-        -------
-        float
-            Sum of selected entries.
+        self : EdgeSelector
+            Fitted selector with `mask_pos_` and `mask_neg_` attributes.
 
         Raises
         ------
         ValueError
-            If method is not 'pos' or 'neg'.
+            If no edges survive the given threshold for the specified network_type.
         """
-        if method == 'pos':
-            return vec[vec > 0].sum()
-        elif method == 'neg':
-            return vec[vec < 0].sum()
-        else:
-            raise ValueError("method must be 'pos' or 'neg'")
+        X = _to_numpy(X)
+        y = _to_numpy(y).ravel()
+        vals, p = fc_behav_test(X, y, task=self.task, covariates=self.covariates)
+        self.mask_pos_ = (vals > 0) & (p < self.threshold)
+        self.mask_neg_ = (vals < 0) & (p < self.threshold)
 
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        """
-        Determine which edges survive univariate testing.
-
-        Parameters
-        ----------
-        X : np.ndarray, shape (n_samples, n_edges)
-            Connectivity feature matrix.
-        y : np.ndarray, shape (n_samples,) or (n_samples, 1)
-            Target variable(s).
-
-        Returns
-        -------
-        self
-            Fitted selector with mask_.
-
-        Raises
-        ------
-        ValueError
-            If no edges remain under the threshold.
-        """
-        _, p_vals = fc_behav_test(
-            X,
-            y,
-            task=self.task,
-            covariates=self.covariates
-        )
-        self.mask_ = p_vals < self.threshold
-        if not np.any(self.mask_):
-            raise ValueError(f"No edges survive p<{self.threshold} selection!")
+        if self.network_type == "pos" and not self.mask_pos_.any():
+            raise ValueError("No positive edges survive threshold.")
+        if self.network_type == "neg" and not self.mask_neg_.any():
+            raise ValueError("No negative edges survive threshold.")
+        if self.network_type == "both" and not (
+            self.mask_pos_.any() or self.mask_neg_.any()
+        ):
+            raise ValueError("No edges survive threshold.")
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """
-        Summarize selected edges into two features per sample.
-
-        Steps:
-        1. Apply mask to each sample's connectivity vector.
-        2. Compute sum of positive weights and sum of negative weights.
+    def transform(self, X):  # noqa: D401
+        """Transform input to CPM summary features based on fitted masks.
 
         Parameters
         ----------
-        X : np.ndarray, shape (n_samples, n_edges)
-            Connectivity features.
+        X : array-like, shape (n_samples, n_edges)
+            FC edge matrix to summarize.
 
         Returns
         -------
-        np.ndarray, shape (n_samples, 2)
-            Array where columns are [pos_sum, neg_sum].
+        features : ndarray, shape (n_samples, n_features)
+            Summary features: one column per selected network_type ('pos_sum',
+            'neg_sum', or both).
         """
-        sig = np.array([self._apply_mask(row) for row in X])
-        pos = np.apply_along_axis(self._sum_edges, 1, sig, method='pos')
-        neg = np.apply_along_axis(self._sum_edges, 1, sig, method='neg')
-        return np.vstack((pos, neg)).T
+        X = _to_numpy(X)
+        feats: List[np.ndarray] = []
+        if self.network_type in ("both", "pos"):
+            feats.append(X[:, self.mask_pos_].sum(axis=1))
+        if self.network_type in ("both", "neg"):
+            feats.append(X[:, self.mask_neg_].sum(axis=1))
+        return np.vstack(feats).T
 
-    def get_support_mask(self) -> np.ndarray:
-        """
-        Return the boolean mask of selected edges.
+    def get_feature_names(self):  # noqa: D401
+        """Get names of the summary features produced by `transform`.
 
         Returns
         -------
-        np.ndarray, shape (n_edges,)
-            Mask where True indicates edges kept during fit().
+        names : list of str
+            List containing 'pos_sum' and/or 'neg_sum', depending on network_type.
         """
-        return self.mask_
+        names: List[str] = []
+        if self.network_type in ("both", "pos"):
+            names.append("pos_sum")
+        if self.network_type in ("both", "neg"):
+            names.append("neg_sum")
+        return names
 
 
-# ─── CPM wrapper with covariate support ────────────────────────────────────────
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import Ridge, LogisticRegression
+# -----------------------------------------------------------------------------
+# End-to-end CPM pipeline
+# -----------------------------------------------------------------------------
 
+class CPM_pipe(Pipeline, RegressorMixin):
+    """Complete CPM workflow: edge selection → covariate passthrough → model.
 
-
-
-class CPM_pipe(Pipeline):
-    """
-    Connectome-based Predictive Modeling (CPM) pipeline combining edge selection and prediction,
-    with built-in SHAP explanation support.
-
-    This pipeline consists of two main steps:
-      1. **EdgeSelector**: performs univariate testing on each connectivity edge, retains
-         those below the specified p-value threshold, and summarizes retained edges into
-         two features per subject (sum of positive edges, sum of negative edges), optionally
-         appending covariates.
-      2. **Estimator**: fits a linear (Ridge) or logistic regression model on the summary
-         features (plus covariates, if requested).
+    Wraps EdgeSelector and a linear/logistic estimator into a scikit-learn
+    Pipeline that selects FC edges, optionally passes through covariates,
+    and fits a regression or classification model.
 
     Parameters
     ----------
+    fc_features : iterable of str
+        Column names in the input DataFrame (or keys in dict) corresponding
+        to flattened FC edges.
+    covariate_features : iterable of str or None, default=None
+        Column names for covariates to pass through into the final estimator.
     threshold : float, default=0.01
-        P-value cutoff for selecting edges in the univariate test.
-    task : {'regression', 'classification'}, default='regression'
-        Determines whether to use Pearson correlation (regression) or ANOVA F-test
-        (classification) in EdgeSelector, and which default estimator to use.
-    covariates : array-like of shape (n_samples, n_covariates), optional
-        Covariate matrix for residualization and optional inclusion in the final model.
-    include_covariates : bool, default=False
-        If True, horizontally stacks `covariates` onto the two summary features before
-        fitting the estimator.
+        P-value threshold for edge selection.
+    task : {'regression','classification'}, default='regression'
+        Task type; selects default estimator (Ridge for regression,
+        LogisticRegression for classification) if `estimator` is None.
+    network_type : {'pos','neg','both'}, default='both'
+        Which edges to include ('pos','neg','both').
     estimator : estimator instance or None, default=None
-        A scikit-learn estimator. If None, defaults to:
-          - `Ridge()` for regression tasks
-          - `LogisticRegression(max_iter=1000)` for classification tasks
+        Custom estimator to use after edge selection and covariate passthrough.
+        Must implement `fit` and `predict` (and `predict_proba` if
+        classification).
 
     Attributes
     ----------
     named_steps : dict
-        Mapping of pipeline step names to their fitted transformer/estimator objects.
-    include_covariates : bool
-        Indicates whether covariates were included in the final feature matrix.
-
-    Methods
-    -------
-    explain(X)
-        Compute SHAP values for the summary features (and covariates) in `X`, returning
-        (shap_values, feature_matrix, feature_names) to interpret model predictions.
+        Dictionary mapping step names to transformers/estimators:
+        - 'pre': ColumnTransformer with 'cpm' (EdgeSelector) and 'cov'.
+        - 'model': final estimator instance.
     """
 
-    def __init__(self,
-                 threshold: float = 0.01,
-                 task: str = 'regression',
-                 covariates: np.ndarray = None,
-                 include_covariates: bool = False,
-                 estimator=None):
-        # Step 1: edge selection
-        selector = EdgeSelector(threshold=threshold,
-                                task=task,
-                                covariates=covariates)
-        # Step 2: estimator
-        if estimator is None:
-            estimator = (LogisticRegression(max_iter=1000)
-                         if task == 'classification'
-                         else Ridge())
-        super().__init__([
-            ('selector', selector),
-            ('estimator', estimator)
-        ])
-        self.include_covariates = include_covariates
+    def __init__(
+        self,
+        fc_features: Iterable[str],
+        covariate_features: Iterable[str] | None = None,
+        *,
+        threshold: float = 0.01,
+        task: str = "regression",
+        network_type: str = "both",
+        estimator=None,
+    ) -> None:
+        # store params for clone() compatibility
+        self.fc_features = fc_features
+        self.covariate_features = covariate_features
+        self.threshold = threshold
+        self.task = task
+        self.network_type = network_type
+        self.estimator = estimator
 
-    def explain(self, X: np.ndarray):
-        """
-        Compute SHAP explanations for the fitted CPM pipeline.
+        # prepare column lists
+        _fc_cols = list(fc_features)
+        _cov_cols = [] if covariate_features is None else list(covariate_features)
 
-        This method:
-          1. Transforms raw connectivity data `X` into summary features via the
-             fitted EdgeSelector.
-          2. Optionally appends covariates if `include_covariates=True`.
-          3. Builds a SHAP LinearExplainer for the final estimator on these features.
-          4. Returns the SHAP values alongside the feature matrix and feature names.
-
-        Parameters
-        ----------
-        X : np.ndarray, shape (n_samples, n_edges)
-            Raw connectivity data to explain.
-
-        Returns
-        -------
-        shap_values : array-like
-            SHAP values for each feature and sample.
-        feature_matrix : np.ndarray, shape (n_samples, n_features)
-            [pos_sum, neg_sum] per sample, plus covariates if included.
-        feature_names : list of str
-            Names corresponding to columns in `feature_matrix`, e.g. ['pos_sum', 'neg_sum', 'cov0', ...]
-
-        Raises
-        ------
-        ValueError
-            If called before the pipeline has been fitted (i.e., no `selector` or `estimator`).
-
-        Examples
-        --------
-        >>> cpm = CPM_pipe(threshold=0.05, task='regression', covariates=covs)
-        >>> cpm.fit(X, y)
-        >>> shap_vals, feats, names = cpm.explain(X)
-        >>> print(names)
-        ['pos_sum', 'neg_sum', 'cov0', 'cov1']
-        """
-        # 1) summary features
-        feats = self.named_steps['selector'].transform(X)
-
-        # 2) append covariates if requested
-        if self.include_covariates:
-            covs = self.named_steps['selector'].covariates
-            feats = np.hstack((feats, covs))
-
-        # 3) instantiate SHAP explainer
-        explainer = shap.LinearExplainer(
-            self.named_steps['estimator'],
-            feats,
-            feature_dependence="independent"
+        # default estimator if none provided
+        _est = (
+            estimator
+            if estimator is not None
+            else (Ridge() if task == "regression" else LogisticRegression(max_iter=1000))
         )
-        shap_values = explainer.shap_values(feats)
 
-        # 4) feature names
-        names = ['pos_sum', 'neg_sum']
-        if self.include_covariates:
-            names += [f'cov{i}' for i in range(covs.shape[1])]
+        # build preprocessing + modeling pipeline
+        pre = ColumnTransformer(
+            [
+                ("cpm", EdgeSelector(threshold, task, network_type), _fc_cols),
+                ("cov", "passthrough", _cov_cols),
+            ]
+        )
+        super().__init__([("pre", pre), ("model", _est)])
 
-        return shap_values, feats, names
+    # def explain(self, X):
+    #     """Compute SHAP values for CPM features + covariates.
 
+    #     Parameters
+    #     ----------
+    #     X : DataFrame-like or dict
+    #         Input data containing FC edge columns and (optional) covariates.
 
+    #     Returns
+    #     -------
+    #     shap_vals : array
+    #         SHAP values for each feature (CPM summary + covariates).
+    #     feats : ndarray, shape (n_samples, n_features)
+    #         Numeric feature matrix used for SHAP (output of 'pre'.transform).
+    #     names : list of str
+    #         Feature names corresponding to columns in `feats`.
+
+    #     Examples
+    #     --------
+    #     >>> pipe = CPM_pipe(fc_cols, cov_cols, task='regression')
+    #     >>> pipe.fit(df)
+    #     >>> shap_vals, feats, names = pipe.explain(df)
+    #     """
+    #     feats = self.named_steps["pre"].transform(X)
+    #     expl = shap.LinearExplainer(
+    #         self.named_steps["model"], feats, feature_perturbation="correlation_dependent" 
+    #     )
+    #     shap_vals = expl.shap_values(feats)
+    #     names = self.named_steps["pre"].named_transformers_["cpm"].get_feature_names()
+    #     if self.covariate_features is not None:
+    #         names.extend(self.covariate_features)
+    #     return shap_vals, feats, names
