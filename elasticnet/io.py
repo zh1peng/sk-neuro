@@ -7,8 +7,7 @@ import time
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import cross_val_predict
-from .estimator import ElasticNetCV
-from .cv_utils import corr_y, repeated_parallel_cv
+from .cv_utils import pearson_corr, repeated_parallel_cv
 
 
 def run_cv_on_csv(data_csv: str) -> tuple:
@@ -29,8 +28,6 @@ def run_cv_on_csv(data_csv: str) -> tuple:
     flag_col = np.array([idx for idx, col in enumerate(fs_df.columns) if 'flag' in col])
     fs = np.array(fs_df)
     from .estimator import GlmnetElasticNetCV
-    from .cv_utils import pearson_corr
-    from sklearn.model_selection import cross_val_predict
     clf = GlmnetElasticNetCV(not2preprocess=flag_col)
     y_pred = cross_val_predict(clf, fs, y, cv=10, n_jobs=-1)
     r_value, p_value = pearson_corr(y_pred, y)
