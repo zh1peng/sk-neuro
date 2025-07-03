@@ -61,11 +61,29 @@ class SelectEdges(BaseEstimator, TransformerMixin):
 class CPM(BaseEstimator):
     """
     Sklearn‐style CPM with .fit/.predict and .explain for SHAP.
-    Internally uses SelectEdges + a linear model (default Ridge).
+    Internally uses SelectEdges + a linear model.
+
+    Parameters
+    ----------
+    threshold : float
+        Edge-selection p-value threshold.
+    estimator : sklearn estimator, optional
+        If None, Ridge is used for regression and LogisticRegression for
+        classification.
+    task : {'regression', 'classification'}
+        Type of prediction task.
     """
-    def __init__(self, threshold=0.01, estimator=None):
+    def __init__(self, threshold=0.01, estimator=None, task='regression'):
         self.threshold = threshold
-        self.estimator = estimator if estimator is not None else Ridge()
+        self.task = task
+        if estimator is not None:
+            self.estimator = estimator
+        else:
+            if self.task == 'classification':
+                from sklearn.linear_model import LogisticRegression
+                self.estimator = LogisticRegression(max_iter=1000)
+            else:
+                self.estimator = Ridge()
         self.selector = SelectEdges(threshold=self.threshold)
 
     def fit(self, X, y):

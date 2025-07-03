@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import cross_val_predict
 from .cv_utils import pearson_corr, repeated_parallel_cv
+from sklearn.metrics import accuracy_score
 
 
-def run_cv_on_csv(data_csv: str) -> tuple:
+def run_cv_on_csv(data_csv: str, family: str = 'gaussian') -> tuple:
     """
     Run cross-validated prediction on a single CSV file.
     Returns r, p, and elapsed time as a tuple.
@@ -28,9 +29,21 @@ def run_cv_on_csv(data_csv: str) -> tuple:
     flag_col = np.array([idx for idx, col in enumerate(fs_df.columns) if 'flag' in col])
     fs = np.array(fs_df)
     from .estimator import GlmnetElasticNetCV
-    clf = GlmnetElasticNetCV(not2preprocess=flag_col)
+    clf = GlmnetElasticNetCV(not2preprocess=flag_col, family=family)
     y_pred = cross_val_predict(clf, fs, y, cv=10, n_jobs=-1)
-    r_value, p_value = pearson_corr(y_pred, y)
+    if family == 'gaussian':
+        r_value, p_value = pearson_corr(y_pred, y)
+    else:
+        if y.ndim > 1 and y.shape[1] > 1:
+            y_true = y.argmax(axis=1)
+        else:
+            y_true = y.ravel()
+        if y_pred.ndim > 1 and y_pred.shape[1] > 1:
+            y_label = y_pred.argmax(axis=1)
+        else:
+            y_label = (y_pred > 0.5).astype(int).ravel()
+        r_value = accuracy_score(y_true, y_label)
+        p_value = np.nan
     e = int(time.time() - start_time)
     e_time = '{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60)
     with open('appending_results.txt', 'a+') as fo:
@@ -38,7 +51,7 @@ def run_cv_on_csv(data_csv: str) -> tuple:
     return r_value, p_value, e_time
 
 
-def save_cv_diagnostic_plot(data_csv: str) -> None:
+def save_cv_diagnostic_plot(data_csv: str, family: str = 'gaussian') -> None:
     """
     Fit GlmnetElasticNetCV and save diagnostic plot for a single CSV file.
     Args:
@@ -52,12 +65,12 @@ def save_cv_diagnostic_plot(data_csv: str) -> None:
     flag_col = np.array([idx for idx, col in enumerate(fs_df.columns) if 'flag' in col])
     fs = np.array(fs_df)
     from .estimator import GlmnetElasticNetCV
-    clf = GlmnetElasticNetCV(not2preprocess=flag_col)
+    clf = GlmnetElasticNetCV(not2preprocess=flag_col, family=family)
     clf.fit(fs, y)
     clf.diagnostic_plot1(csv_name + '1.png')
 
 
-def run_cv_on_directory(data_path: str) -> pd.DataFrame:
+def run_cv_on_directory(data_path: str, family: str = 'gaussian') -> pd.DataFrame:
     """
     Run run_cv_on_csv on all CSV files in a directory.
     Returns a DataFrame with r, p, and time for each file.
@@ -73,7 +86,7 @@ def run_cv_on_directory(data_path: str) -> pd.DataFrame:
     all_p = []
     all_time = []
     for csv in csv2test:
-        tmp_r, tmp_p, tmp_time = run_cv_on_csv(csv)
+        tmp_r, tmp_p, tmp_time = run_cv_on_csv(csv, family=family)
         all_r.append(str(tmp_r))
         all_p.append(str(tmp_p))
         all_time.append(str(tmp_time))
@@ -81,7 +94,8 @@ def run_cv_on_directory(data_path: str) -> pd.DataFrame:
     return df
 
 
-def run_repeated_cv_on_csv(data_csv: str, n_repeats: int = 50, shuffle_y: bool = False) -> dict:
+def run_repeated_cv_on_csv(data_csv: str, n_repeats: int = 50, shuffle_y: bool = False,
+                           family: str = 'gaussian') -> dict:
     """
     Run repeated cross-validation on a single CSV file.
     Returns the results dictionary.
@@ -101,6 +115,14 @@ def run_repeated_cv_on_csv(data_csv: str, n_repeats: int = 50, shuffle_y: bool =
     fs = np.array(fs_df)
     from .estimator import GlmnetElasticNetCV
     from .cv_utils import repeated_parallel_cv
-    clf = GlmnetElasticNetCV(not2preprocess=flag_col)
+    clf = GlmnetElasticNetCV(not2preprocess=flag_col, family=family)
     results = repeated_parallel_cv(clf, fs, y, nfold=10, n_repeats=n_repeats, shuffle_y=shuffle_y)
+    if family != 'gaussian':
+        if y.ndim > 1 and y.shape[1] > 1:
+            y_true = y.argmax(axis=1)
+        else:
+            y_true = y.ravel()
+        from scipy.stats import mode
+        majority_pred = mode(results['all_y_pred'], axis=-1, keepdims=False).mode
+        results['accuracy'] = accuracy_score(y_true, majority_pred)
     return results

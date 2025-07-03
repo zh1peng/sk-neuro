@@ -74,6 +74,8 @@ class GlmnetElasticNetCV(BaseEstimator):
         self.quantile = quantile
         self.ptype = ptype
         self.family = family
+        if self.family in ['binomial', 'multinomial'] and self.ptype == 'mse':
+            self.ptype = 'deviance'
         self.not2preprocess = not2preprocess
         self.estimators = []
         self.best_cvm = None
@@ -143,12 +145,34 @@ class GlmnetElasticNetCV(BaseEstimator):
             X2win = self.scaler_.transform(X2use)
             X_win = self.clipper_.transform(X2win)
             X_norm = np.hstack([X_win, X2exclude])
-        pred = cvglmnetPredict(self.best_estimator, X_norm, s='lambda_min')
+        ptype = 'response' if self.family in ['binomial', 'multinomial'] else 'link'
+        pred = cvglmnetPredict(self.best_estimator, X_norm, s='lambda_min', ptype=ptype)
         if self.family == 'gaussian':
             pred2return = pred.reshape(-1)
+        elif self.family == 'binomial':
+            pred2return = (pred.reshape(-1) > 0.5).astype(int)
+        elif self.family == 'multinomial':
+            pred2return = pred.argmax(axis=1)
         else:
             pred2return = np.squeeze(pred)
         return pred2return
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.family not in ['binomial', 'multinomial']:
+            raise ValueError('predict_proba only available for classification families')
+        if self.not2preprocess is None:
+            X2use = X.copy()
+            X2win = self.scaler_.transform(X2use)
+            X_win = self.clipper_.transform(X2win)
+            X_norm = X_win.copy()
+        else:
+            X2exclude = X[:, self.not2preprocess]
+            X2use = np.delete(X, self.not2preprocess, axis=1)
+            X2win = self.scaler_.transform(X2use)
+            X_win = self.clipper_.transform(X2win)
+            X_norm = np.hstack([X_win, X2exclude])
+        proba = cvglmnetPredict(self.best_estimator, X_norm, s='lambda_min', ptype='response')
+        return np.squeeze(proba)
 
     def get_info(self) -> dict:
         """
