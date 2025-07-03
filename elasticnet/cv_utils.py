@@ -4,7 +4,7 @@ Cross-validation utilities for ElasticNet in sk-neuro.
 
 import numpy as np
 from sklearn.model_selection import KFold
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, accuracy_score
 from sklearn.base import clone
 from sklearn.utils import shuffle
 from joblib import Parallel, delayed
@@ -39,8 +39,11 @@ def _fit_and_score_fold(
     estimator.fit(X_train, y_train)
     y_pred = estimator.predict(X_test)
     fold_y_pred.append(y_pred)
-    mse_score = mean_squared_error(y_test, y_pred, multioutput='raw_values')
-    fold_score.append(mse_score)
+    if estimator.family in ['gaussian', 'mgaussian']:
+        score = mean_squared_error(y_test, y_pred, multioutput='raw_values')
+    else:
+        score = accuracy_score(y_test.ravel(), y_pred.ravel())
+    fold_score.append(score)
     tuning_info = estimator.get_info()
     fold_coef.append(tuning_info['coef'])
     fold_alpha.append(tuning_info['best_alpha'])
@@ -87,7 +90,10 @@ def parallel_cv(
     fold_coef_ = np.squeeze(np.vstack(fold_coef).T)
     fold_alpha_ = np.array(fold_alpha).reshape(-1)
     fold_l1_ = np.array(fold_l1).reshape(-1)
-    fold_score_ = np.vstack(fold_score).T
+    if isinstance(fold_score[0], np.ndarray):
+        fold_score_ = np.vstack(fold_score).T
+    else:
+        fold_score_ = np.array(fold_score)
     sorted_y_pred_ = sorted_y_pred
     return fold_coef_, fold_alpha_, fold_l1_, fold_score_, sorted_y_pred_
 
